@@ -235,17 +235,48 @@ step "4/7: Install vLLM"
 
 mkdir -p "$VLLM_PIP_CACHE" "$VLLM_CACHE_DIR"
 
+VLLM_PYTHON="python"  # default, may change if venv needed
+
 if python -c "import vllm" &>/dev/null; then
   VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
   ok "vLLM already installed: v${VLLM_VER}"
+elif [ -f "/workspace/vllm-env/bin/python" ] && /workspace/vllm-env/bin/python -c "import vllm" &>/dev/null; then
+  VLLM_PYTHON="/workspace/vllm-env/bin/python"
+  VLLM_VER=$($VLLM_PYTHON -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+  ok "vLLM found in venv: v${VLLM_VER}"
 else
-  log "Installing vLLM via pip (caching at ${VLLM_PIP_CACHE})..."
-  log "This takes 2-5 minutes on first install..."
-  if pip install vllm --cache-dir "$VLLM_PIP_CACHE" --quiet 2>&1; then
-    VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
-    ok "vLLM installed: v${VLLM_VER}"
+  # Detect CUDA version — vLLM stable needs CUDA 12.4, RunPod often has 12.8+
+  CUDA_MAJOR=$(nvidia-smi | grep "CUDA Version" | awk '{print $9}' | cut -d. -f1)
+  CUDA_MINOR=$(nvidia-smi | grep "CUDA Version" | awk '{print $9}' | cut -d. -f2)
+  log "Detected CUDA ${CUDA_MAJOR}.${CUDA_MINOR}"
+
+  if [ "${CUDA_MAJOR}" -ge 12 ] && [ "${CUDA_MINOR}" -ge 8 ]; then
+    log "CUDA >= 12.8 — using vLLM nightly wheels (stable needs CUDA 12.4)..."
+    log "This takes 3-8 minutes on first install..."
+    if pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly --cache-dir "$VLLM_PIP_CACHE" 2>&1; then
+      VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+      ok "vLLM installed (nightly): v${VLLM_VER}"
+    else
+      warn "Nightly failed — trying stable in isolated venv..."
+      python -m venv /workspace/vllm-env --system-site-packages
+      /workspace/vllm-env/bin/pip install vllm --cache-dir "$VLLM_PIP_CACHE" 2>&1
+      VLLM_PYTHON="/workspace/vllm-env/bin/python"
+      if $VLLM_PYTHON -c "import vllm" &>/dev/null; then
+        VLLM_VER=$($VLLM_PYTHON -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+        ok "vLLM installed (venv fallback): v${VLLM_VER}"
+      else
+        fail "vLLM installation failed. Try: pip install vllm manually and check errors."
+      fi
+    fi
   else
-    fail "vLLM installation failed. Check pip output above."
+    log "Installing vLLM stable via pip..."
+    log "This takes 2-5 minutes on first install..."
+    if pip install vllm --cache-dir "$VLLM_PIP_CACHE" --quiet 2>&1; then
+      VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+      ok "vLLM installed: v${VLLM_VER}"
+    else
+      fail "vLLM installation failed. Check pip output above."
+    fi
   fi
 fi
 
@@ -269,7 +300,7 @@ log "  GPU util: ${VLLM_GPU_UTIL} (${VLLM_GPU_UTIL}% of VRAM)"
 log "  Max context: ${VLLM_MAX_MODEL_LEN} tokens"
 log "  Model cache: ${VLLM_CACHE_DIR}"
 
-python -m vllm.entrypoints.openai.api_server \
+$VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
   --model "$VLLM_MODEL" \
   --dtype bfloat16 \
   --gpu-memory-utilization "$VLLM_GPU_UTIL" \
